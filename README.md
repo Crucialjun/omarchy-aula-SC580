@@ -9,6 +9,8 @@ The mouse speaks a vendor HID protocol that was reverse-engineered from
 `AULA_SC580_Software.exe`; the write-up with evidence is in
 [PROTOCOL.md](PROTOCOL.md).
 
+![The SC580 panel in the Omarchy bar](preview.png)
+
 ## What you get
 
 **In the bar:** a mouse icon — with the battery percentage when you're on the

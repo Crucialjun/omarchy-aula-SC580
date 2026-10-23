@@ -9,7 +9,7 @@ marketplace repo's `SUBMISSION.md` (omacom/omarchy-plugin-marketplace):
 - [x] Namespaced lowercase id outside `omarchy.*`: `io.github.crucialjun.aula-sc580`
 - [x] No symlinks in the tree (`omarchy plugin validate .` passes)
 - [ ] Public GitHub repository at the root URL (no `/tree/main`)
-- [ ] Optional `preview.png` at the root — a screenshot of the open panel (any size; the marketplace optimises it)
+- [x] `preview.png` at the root — screenshot of the open panel (the marketplace optimises it)
 - [ ] The plugin id must match your GitHub user: if your account isn't `crucialjun`, change it everywhere first:
       `grep -rl "io.github.crucialjun" --exclude-dir=.git . | xargs sed -i 's/io.github.crucialjun/io.github.YOURNAME/g'`
 
