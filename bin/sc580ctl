@@ -1,0 +1,943 @@
+#!/usr/bin/env python3
+"""sc580ctl — Linux configurator for the AULA SC580 / SC580X gaming mouse.
+
+Speaks the vendor HID protocol ("CBMouse" protocol 3) that the Windows
+AULA_SC580_Software.exe uses, reverse-engineered from CBMouse.exe.
+Pure Python 3 standard library; talks to /dev/hidraw* directly.
+
+See PROTOCOL.md next to this file for the wire format and evidence.
+"""
+
+import argparse
+import json
+import os
+import select
+import struct
+import sys
+import time
+
+VERSION = "0.2.0"
+
+# ---------------------------------------------------------------------------
+# Device identity (device/mouse/sc580/MS.ini)
+# ---------------------------------------------------------------------------
+DEVICES = {
+    (0x088D, 0x062E): "wired",     # devVID / devPID
+    (0x089D, 0x062F): "wireless",  # devVID_Wireless / devPID_Wireless (2.4G dongle)
+}
+VENDOR_USAGE_PAGE = 0xFF02       # CDevDM::FindHIDDevice matches usage page 0xFF02, usage 0
+IDENTITY = b"M137"               # MS.ini Identify=4d,31,33,37; reply to cmd 0x30 begins with it
+SENSOR_ID = 0x3311               # PAW3311; device-info byte 0x11 -> 0x3311
+SENSOR_BYTES = {0x11: "PAW3311", 0x25: "PAW3325", 0x35: "PAW3335", 0x95: "PAW3395"}  # GetSensor @0x00417000
+
+# ---------------------------------------------------------------------------
+# Protocol constants (CDevDM @ 0x00456f00..0x0045aa70 in CBMouse.exe)
+# ---------------------------------------------------------------------------
+REPORT_LEN = 32                  # payload; Windows wrote 0x21 = report-id 0 + 32
+MAX_DATA = 27                    # bytes 4..30
+CMD_SET_KEY = 0x01
+CMD_SET_RATE = 0x02
+CMD_SET_DPI = 0x03
+CMD_SET_DPI_COLOR = 0x04
+CMD_SET_LED = 0x05
+CMD_SET_SENSOR = 0x06
+CMD_SET_WIRELESS = 0x07
+CMD_SET_MACRO = 0x08
+CMD_SET_MATRIX = 0x09
+CMD_RESET = 0x0F
+CMD_GET_DPI = 0x13
+CMD_GET_INFO = 0x30
+NOTIFY_POWER = 0xD1
+NOTIFY_DPI = 0xD2
+
+STATUS_OK, STATUS_BUSY, STATUS_OFFLINE, STATUS_DATA_ERR = 0, 1, 2, 3
+
+RATE_CODES = {1000: 0x01, 500: 0x02, 250: 0x04, 125: 0x08, 2000: 0x10, 4000: 0x20}
+SUPPORTED_RATES = [125, 250, 500, 1000]          # MS.ini UsbRate
+DPI_MIN, DPI_MAX, DPI_STEP = 200, 12000, 100     # PAW3311 table in CBMouse.exe @0x00416xxx
+MAX_DPI_STAGES = 6                               # MS.ini DpiNum
+DEBOUNCE_MS = [4, 6, 8, 10, 12, 14, 16, 18, 20]  # MS.ini DebounceUI (HW value == ms)
+SLEEP_SECONDS = [30, 60, 90, 120, 180, 240, 300, 600, 900, 1200]  # HW value = seconds / 30
+
+# Physical buttons: MS.ini [KEY] K1..K6 -> matrix index 1..6 (SetKey uses index-1)
+BUTTONS = {
+    1: "Left button",
+    2: "Right button",
+    3: "Middle button",
+    4: "Forward (side)",
+    5: "Back (side)",
+    6: "DPI button",
+}
+
+# Hardware key codes: 24-bit little-endian, from keyinfo_to_hardware_code @0x0045aa70
+# low byte = class: 0x20 mouse button, 0x30 wheel, 0x50 DPI, 0x70 misc/LED,
+# 0x80 keyboard combo (mods, keycode), 0x90 consumer control (16-bit usage), 0xA0 macro
+KEY_FUNCTIONS = {
+    # mouse
+    "left":          0x000120,
+    "right":         0x000220,
+    "middle":        0x000420,
+    "back":          0x000820,
+    "forward":       0x001020,
+    "scroll_up":     0x000130,
+    "scroll_down":   0x00FF30,
+    "triple_click":  0x033240,
+    # dpi
+    "dpi_loop":      0x000150,
+    "dpi_up":        0x000250,
+    "dpi_down":      0x000350,
+    # lighting / misc
+    "rgb_toggle":    0x000170,
+    "effect_switch": 0x000470,
+    "disable":       0x000070,
+    # multimedia (consumer page usage << 8 | 0x90)
+    "play_pause":    0x00CD90,
+    "media_stop":    0x00B790,
+    "prev_track":    0x00B690,
+    "next_track":    0x00B590,
+    "volume_up":     0x00E990,
+    "volume_down":   0x00EA90,
+    "mute":          0x00E290,
+    "brightness_up": 0x006F90,
+    "brightness_down": 0x007090,
+    "media_player":  0x018390,
+    "email":         0x018A90,
+    "calculator":    0x019290,
+    "my_computer":   0x019490,
+    "www_search":    0x022190,
+    "www_home":      0x022390,
+    "www_back":      0x022490,
+    "www_forward":   0x022590,
+    "www_stop":      0x022690,
+    "www_refresh":   0x022790,
+    "favorites":     0x022A90,
+    # keyboard shortcuts (keycode<<16 | modifiers<<8 | 0x80)
+    "copy":          0x060180,   # Ctrl+C
+    "paste":         0x190180,   # Ctrl+V
+    "undo":          0x1D0180,   # Ctrl+Z
+    "save":          0x160180,   # Ctrl+S
+    "zoom_in":       0x2E0180,   # Ctrl+=
+    "zoom_out":      0x2D0180,   # Ctrl+-
+    "close_window":  0x3D0480,   # Alt+F4
+    "lock_screen":   0x0F0880,   # Super+L
+    "run":           0x150880,   # Super+R
+    "show_desktop":  0x070880,   # Super+D
+    "task_manager":  0x4C0580,   # Ctrl+Alt+Del
+}
+DEFAULT_KEYS = {1: "left", 2: "right", 3: "middle", 4: "forward", 5: "back", 6: "dpi_loop"}
+
+HID_MODS = {"ctrl": 0x01, "shift": 0x02, "alt": 0x04, "super": 0x08, "win": 0x08, "meta": 0x08}
+HID_KEYS = {}
+for _i, _c in enumerate("abcdefghijklmnopqrstuvwxyz"):
+    HID_KEYS[_c] = 0x04 + _i
+for _i, _c in enumerate("1234567890"):
+    HID_KEYS[_c] = 0x1E + _i
+HID_KEYS.update({
+    "enter": 0x28, "esc": 0x29, "escape": 0x29, "backspace": 0x2A, "tab": 0x2B, "space": 0x2C,
+    "minus": 0x2D, "-": 0x2D, "equal": 0x2E, "=": 0x2E, "lbracket": 0x2F, "rbracket": 0x30,
+    "backslash": 0x31, "semicolon": 0x33, "quote": 0x34, "grave": 0x35, "comma": 0x36,
+    "period": 0x37, "slash": 0x38, "capslock": 0x39,
+    "printscreen": 0x46, "scrolllock": 0x47, "pause": 0x48, "insert": 0x49, "home": 0x4A,
+    "pageup": 0x4B, "delete": 0x4C, "end": 0x4D, "pagedown": 0x4E, "right": 0x4F,
+    "left": 0x50, "down": 0x51, "up": 0x52, "numlock": 0x53,
+})
+for _i in range(1, 13):
+    HID_KEYS["f%d" % _i] = 0x3A + _i - 1
+for _i in range(13, 25):
+    HID_KEYS["f%d" % _i] = 0x68 + _i - 13
+
+
+def parse_key_function(spec):
+    """'left' | 'dpi_up' | 'kbd:ctrl+shift+t' | '0x000120' -> 24-bit code."""
+    s = spec.strip().lower()
+    if s in KEY_FUNCTIONS:
+        return KEY_FUNCTIONS[s]
+    if s.startswith("kbd:"):
+        parts = [p for p in s[4:].split("+") if p]
+        mods, key = 0, None
+        for p in parts:
+            if p in HID_MODS:
+                mods |= HID_MODS[p]
+            elif p in HID_KEYS:
+                if key is not None:
+                    raise ValueError("only one non-modifier key allowed in %r" % spec)
+                key = HID_KEYS[p]
+            else:
+                raise ValueError("unknown key %r in %r" % (p, spec))
+        if key is None:
+            raise ValueError("kbd: needs a key, e.g. kbd:ctrl+shift+t")
+        return (key << 16) | (mods << 8) | 0x80
+    if s.startswith("0x"):
+        v = int(s, 16)
+        if not 0 <= v <= 0xFFFFFF:
+            raise ValueError("raw key code must be 24-bit")
+        return v
+    raise ValueError("unknown key function %r (try: sc580ctl keys)" % spec)
+
+
+# ---------------------------------------------------------------------------
+# Config store (the Windows app keeps settings on the PC too: the mouse has no
+# "read config" command besides 0x13/0x30)
+# ---------------------------------------------------------------------------
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "sc580", "config.json")
+
+
+def default_config():
+    return {
+        "dpi": {"stages": [800, 1600, 2400, 3200, 6400, 12000], "current": 1},  # MS.ini DPI=, DefStage=1 (0-based)
+        "dpi_colors": [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 0, 255], [0, 255, 255], [255, 255, 0]],
+        "rate": 500,            # MS.ini DefaultRate=0x500
+        "keys": {str(k): v for k, v in DEFAULT_KEYS.items()},
+        "sleep_seconds": 180,   # MS.ini DefSleepTime=6 -> 6*30s
+        "debounce_ms": 8,       # MS.ini Debounce=0x0209 -> default index 2 of DebounceUI
+        "wake_on_move": True,
+        "light_off_moving": False,
+        "angle_snap": False,
+        "ripple": False,
+        "lod": 1,               # 1 or 2 (mm); SC580 hides this in the UI
+    }
+
+
+def load_config():
+    cfg = default_config()
+    try:
+        with open(config_path()) as f:
+            user = json.load(f)
+        for k, v in user.items():
+            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                cfg[k].update(v)
+            else:
+                cfg[k] = v
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    p = config_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, p)
+
+
+# ---------------------------------------------------------------------------
+# Packet encoding
+# ---------------------------------------------------------------------------
+def build_packet(cmd, data=b"", n_packages=1, package_index=0):
+    """CDevDM::SendOne framing (@0x00457ba0):
+    [0]=cmd [1]=0 [2]=(nPackages&0xF)|(index<<4) [3]=len [4..30]=data [31]=sum(payload[4..30])"""
+    if len(data) > MAX_DATA:
+        raise ValueError("data too long")
+    pkt = bytearray(REPORT_LEN)
+    pkt[0] = cmd & 0xFF
+    pkt[1] = 0
+    pkt[2] = (n_packages & 0x0F) | ((package_index & 0x0F) << 4)
+    pkt[3] = len(data)
+    pkt[4:4 + len(data)] = data
+    pkt[31] = sum(pkt[4:31]) & 0xFF
+    return bytes(pkt)
+
+
+def hexdump(b):
+    return " ".join("%02x" % x for x in b)
+
+
+class ProtocolError(Exception):
+    pass
+
+
+class DeviceOffline(ProtocolError):
+    pass
+
+
+class NoPermission(ProtocolError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Transport: raw hidraw
+# ---------------------------------------------------------------------------
+def _sysfs_hidraw_candidates():
+    found = []
+    root = "/sys/class/hidraw"
+    if not os.path.isdir(root):
+        return found
+    for name in sorted(os.listdir(root)):
+        dev = os.path.join(root, name, "device")
+        try:
+            with open(os.path.join(dev, "uevent")) as f:
+                uevent = f.read()
+        except OSError:
+            continue
+        hid_id = None
+        for line in uevent.splitlines():
+            if line.startswith("HID_ID="):
+                hid_id = line.split("=", 1)[1]
+        if not hid_id:
+            continue
+        try:
+            bus, vid, pid = [int(x, 16) for x in hid_id.split(":")]
+        except ValueError:
+            continue
+        if (vid, pid) not in DEVICES:
+            continue
+        # The mouse exposes several HID interfaces; the configurable one is the
+        # vendor-defined collection (usage page 0xFF02). Check the descriptor.
+        try:
+            with open(os.path.join(dev, "report_descriptor"), "rb") as f:
+                rdesc = f.read()
+        except OSError:
+            rdesc = b""
+        if rdesc and not _rdesc_has_usage_page(rdesc, VENDOR_USAGE_PAGE):
+            continue
+        found.append(("/dev/" + name, vid, pid, DEVICES[(vid, pid)]))
+    return found
+
+
+def _rdesc_has_usage_page(rdesc, page):
+    i = 0
+    while i < len(rdesc):
+        b = rdesc[i]
+        if b == 0xFE:  # long item
+            if i + 1 >= len(rdesc):
+                break
+            i += 3 + rdesc[i + 1]
+            continue
+        size = b & 3
+        size = 4 if size == 3 else size
+        tag = b & 0xFC
+        val = int.from_bytes(rdesc[i + 1:i + 1 + size], "little") if size else 0
+        if tag == 0x04 and val == page:  # Global: Usage Page
+            return True
+        i += 1 + size
+    return False
+
+
+class HidrawTransport:
+    def __init__(self, path, verbose=False):
+        self.path = path
+        self.verbose = verbose
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self.pending = []
+
+    def close(self):
+        os.close(self.fd)
+
+    def write(self, payload):
+        # hidraw: first byte is the report number (0 = no numbered reports).
+        if self.verbose:
+            print("-> %s" % hexdump(payload), file=sys.stderr)
+        os.write(self.fd, b"\x00" + payload)
+
+    def read(self, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            r, _, _ = select.select([self.fd], [], [], remaining)
+            if not r:
+                return None
+            try:
+                buf = os.read(self.fd, 64)
+            except BlockingIOError:
+                continue
+            if not buf:
+                return None
+            if len(buf) == REPORT_LEN + 1 and buf[0] == 0:
+                buf = buf[1:]
+            buf = buf[:REPORT_LEN]
+            if self.verbose:
+                print("<- %s" % hexdump(buf), file=sys.stderr)
+            return bytes(buf)
+
+
+class DryRunTransport:
+    """Prints packets instead of sending them; fakes OK replies."""
+    def __init__(self):
+        self.path = "(dry-run)"
+        self.last = None
+
+    def close(self):
+        pass
+
+    def write(self, payload):
+        self.last = payload
+        print("would send: %s" % hexdump(payload))
+
+    def read(self, timeout):
+        if self.last is None:
+            return None
+        reply = bytearray(REPORT_LEN)
+        reply[0] = self.last[0]
+        if self.last[0] == CMD_GET_INFO:
+            reply[4:15] = bytes([0x4d, 0x31, 0x33, 0x37, 0x01, 0x16, 0x11, 0xaa, 0x02, 0x64, 0x01])
+        self.last = None
+        return bytes(reply)
+
+
+class Mouse:
+    def __init__(self, transport, kind="unknown"):
+        self.t = transport
+        self.kind = kind
+
+    @classmethod
+    def open(cls, path=None, verbose=False):
+        if path:
+            return cls(HidrawTransport(path, verbose), "manual")
+        cands = _sysfs_hidraw_candidates()
+        if not cands:
+            raise ProtocolError(
+                "no AULA SC580 vendor interface found under /sys/class/hidraw "
+                "(is the mouse/dongle plugged in? is the udev rule installed?)")
+        # Prefer the wired link when both are present.
+        cands.sort(key=lambda c: 0 if c[3] == "wired" else 1)
+        path, vid, pid, kind = cands[0]
+        try:
+            return cls(HidrawTransport(path, verbose), kind)
+        except PermissionError:
+            raise NoPermission(
+                "%s: permission denied — install udev/70-aula-sc580.rules into /etc/udev/rules.d "
+                "(the panel's \"Grant device access\" button or install.sh does this) and replug" % path)
+
+    def close(self):
+        self.t.close()
+
+    # --- core ----------------------------------------------------------
+    def transact(self, cmd, data=b"", n_packages=1, package_index=0, want_reply=True,
+                 timeout=2.0, retries=3):
+        """Send one packet and wait for the echo reply (CDevDM::SendOne + WaitNotify)."""
+        pkt = build_packet(cmd, data, n_packages, package_index)
+        busy = 0
+        for attempt in range(retries):
+            self.t.write(pkt)
+            if not want_reply:
+                return None
+            deadline = time.monotonic() + timeout
+            while True:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise ProtocolError("timeout waiting for reply to cmd 0x%02x" % cmd)
+                rep = self.t.read(rem)
+                if rep is None:
+                    raise ProtocolError("timeout waiting for reply to cmd 0x%02x" % cmd)
+                if rep[0] in (NOTIFY_POWER, NOTIFY_DPI):
+                    continue  # async notification, not our reply
+                if rep[0] != cmd:
+                    continue  # stale reply
+                status = rep[1]
+                if status == STATUS_OK:
+                    return rep[4:4 + MAX_DATA]
+                if status == STATUS_BUSY:
+                    busy += 1
+                    if busy > 2:
+                        raise ProtocolError("device busy (cmd 0x%02x)" % cmd)
+                    time.sleep(0.3)
+                    break
+                if status == STATUS_OFFLINE:
+                    raise DeviceOffline("mouse is offline (asleep or out of range)")
+                if status == STATUS_DATA_ERR:
+                    time.sleep(0.1)
+                    break
+                raise ProtocolError("cmd 0x%02x failed, status=%d" % (cmd, status))
+        raise ProtocolError("cmd 0x%02x failed after retries" % cmd)
+
+    def send_chunked(self, cmd, blob):
+        """Multi-package commands (SetMatrix 0x09 / SetMacro 0x08): 27 bytes per package."""
+        n = (len(blob) + MAX_DATA - 1) // MAX_DATA
+        for i in range(n):
+            chunk = blob[i * MAX_DATA:(i + 1) * MAX_DATA]
+            self.transact(cmd, chunk, n_packages=n, package_index=i)
+            time.sleep(0.02)
+
+    # --- queries -------------------------------------------------------
+    def get_info(self):
+        """cmd 0x30. Offsets verified on hardware (reply data
+        4d 31 33 37 01 16 11 aa 02 64 01): PrivateSyncCfg @0x00457660 indexes the
+        whole 27-byte data block, not just the identity."""
+        d = self.transact(CMD_GET_INFO)
+        charge_state = d[8]           # 0 = on battery, 1 = charging, 2 = full (battery_*.png states)
+        return {
+            "identity": bytes(d[0:4]).decode("ascii", "replace"),
+            "identity_ok": bytes(d[0:4]) == IDENTITY,
+            "firmware": "%d.%d.%02d" % (d[5] >> 4, d[5] & 0xF, d[4]),
+            "firmware_raw": d[4] | (d[5] << 8),
+            "sensor": SENSOR_BYTES.get(d[6], d[6]),
+            "charge_state": charge_state,
+            "charging": charge_state == 1,
+            "full": charge_state == 2,
+            "plugged": charge_state != 0,
+            "battery": d[9],
+            "online": bool(d[10]),
+            "raw": hexdump(d[:12]),
+        }
+
+    def get_dpi_stage(self):
+        d = self.transact(CMD_GET_DPI)
+        return d[0] >> 4  # 0-based stage index (CDevDM::GetDPI @0x004578b0)
+
+    # --- setters -------------------------------------------------------
+    def set_rate(self, hz):
+        if hz not in RATE_CODES:
+            raise ValueError("unsupported polling rate %r" % hz)
+        self.transact(CMD_SET_RATE, bytes([RATE_CODES[hz]]))
+
+    def set_dpi(self, stages, current):
+        if not 1 <= len(stages) <= MAX_DPI_STAGES:
+            raise ValueError("1..%d DPI stages" % MAX_DPI_STAGES)
+        if not 0 <= current < len(stages):
+            raise ValueError("current stage out of range")
+        data = bytearray(MAX_DATA)
+        data[0] = 0
+        data[1] = ((current & 0xF) << 4) | (len(stages) & 0xF)
+        for i, dpi in enumerate(stages):
+            code = dpi_to_code(dpi)
+            struct.pack_into("<HH", data, 2 + 4 * i, code, 0)  # X code, Y code (0 = same as X)
+        self.transact(CMD_SET_DPI, bytes(data))
+
+    def set_dpi_colors(self, colors):
+        data = bytearray(24)
+        for i, (r, g, b) in enumerate(colors[:8]):
+            data[3 * i:3 * i + 3] = bytes([r & 0xFF, g & 0xFF, b & 0xFF])
+        self.transact(CMD_SET_DPI_COLOR, bytes(data))
+
+    def set_key(self, button, code):
+        if button not in BUTTONS:
+            raise ValueError("button must be 1..%d" % len(BUTTONS))
+        data = bytes([button - 1, code & 0xFF, (code >> 8) & 0xFF, (code >> 16) & 0xFF])
+        self.transact(CMD_SET_KEY, data)
+
+    def set_sensor(self, lod=1, angle_snap=False, ripple=False):
+        # CDevDM "Set sensor param": [lodIndex+1, angleSnap, ripple, 0, 0]
+        lod_index = 0 if int(lod) <= 1 else 1
+        self.transact(CMD_SET_SENSOR, bytes([lod_index + 1, int(bool(angle_snap)), int(bool(ripple)), 0, 0]))
+
+    def set_wireless(self, sleep_seconds=180, wake_on_move=True, light_off_moving=False, debounce_ms=8):
+        if sleep_seconds not in SLEEP_SECONDS:
+            raise ValueError("sleep must be one of %s seconds" % SLEEP_SECONDS)
+        if debounce_ms not in DEBOUNCE_MS:
+            raise ValueError("debounce must be one of %s ms" % DEBOUNCE_MS)
+        self.transact(CMD_SET_WIRELESS, bytes([sleep_seconds // 30, int(bool(wake_on_move)),
+                                               int(bool(light_off_moving)), debounce_ms]))
+
+    def set_led(self, mode, brightness=1, speed=1, colors=(), direction=0):
+        """Lighting (hidden for SC580 in the vendor UI: MS.ini ShowLED=0). Modes are the
+        LedItem hardware ids: 0 off, 1 streaming, 2 breathing, 3 steady, 4 neon, 5 tail,
+        6 colorful steady, 7 wave(2 colours), 9 wave."""
+        data = bytearray([mode & 0xFF, (speed & 0xF) | ((brightness & 0xF) << 4)])
+        if mode == 1:
+            data += bytes([0])
+        elif mode == 2:
+            data += bytes([len(colors)]) + b"".join(bytes(c) for c in colors)
+        elif mode == 3:
+            data += bytes(colors[0] if colors else (255, 0, 255))
+        elif mode == 6:
+            cols = list(colors)[:7]
+            while len(cols) < 7:
+                cols.append((255, 255, 255))
+            data += b"".join(bytes(c) for c in cols)
+        elif mode == 7:
+            cols = list(colors)[:2]
+            while len(cols) < 2:
+                cols.append((255, 255, 255))
+            data += b"".join(bytes(c) for c in cols)
+        self.transact(CMD_SET_LED, bytes(data))
+
+    def factory_reset(self):
+        self.transact(CMD_RESET, bytes([0xFF]))
+
+    def apply_config(self, cfg, log=None):
+        """Push everything, in the order CDevDM::ApplySetting uses (@0x00458bd0)."""
+        def say(m):
+            if log:
+                log(m)
+        for b in sorted(BUTTONS):
+            fn = cfg["keys"].get(str(b), DEFAULT_KEYS[b])
+            self.set_key(b, parse_key_function(fn))
+            say("key %d -> %s" % (b, fn))
+            time.sleep(0.03)
+        time.sleep(0.05)
+        self.set_dpi(cfg["dpi"]["stages"], cfg["dpi"]["current"])
+        say("dpi stages %s (active #%d)" % (cfg["dpi"]["stages"], cfg["dpi"]["current"] + 1))
+        time.sleep(0.05)
+        self.set_rate(cfg["rate"])
+        say("polling rate %d Hz" % cfg["rate"])
+        time.sleep(0.05)
+        self.set_sensor(cfg.get("lod", 1), cfg.get("angle_snap", False), cfg.get("ripple", False))
+        say("sensor: lod=%s angle_snap=%s ripple=%s" % (cfg.get("lod", 1), cfg.get("angle_snap"), cfg.get("ripple")))
+        time.sleep(0.05)
+        self.set_wireless(cfg["sleep_seconds"], cfg["wake_on_move"], cfg["light_off_moving"], cfg["debounce_ms"])
+        say("wireless: sleep=%ds wake_on_move=%s light_off_moving=%s debounce=%dms" % (
+            cfg["sleep_seconds"], cfg["wake_on_move"], cfg["light_off_moving"], cfg["debounce_ms"]))
+
+
+def dpi_to_code(dpi):
+    """PAW3311 (sensor 0x3311) table: DPI 200..12000 step 100 -> code 1..119."""
+    if dpi < DPI_MIN or dpi > DPI_MAX or dpi % DPI_STEP:
+        raise ValueError("DPI must be %d..%d in steps of %d (got %r)" % (DPI_MIN, DPI_MAX, DPI_STEP, dpi))
+    return dpi // 100 - 1
+
+
+def parse_notification(rep):
+    if rep[0] == NOTIFY_DPI:
+        return {"event": "dpi", "stage": (rep[1] >> 4) + 1}
+    if rep[0] == NOTIFY_POWER:
+        return {"event": "power", "online": bool(rep[1]), "battery": rep[2], "charge_state": rep[3],
+                "charging": rep[3] == 1, "full": rep[3] == 2}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def open_mouse(args):
+    if args.dry_run:
+        return Mouse(DryRunTransport(), "dry-run")
+    return Mouse.open(args.device, args.verbose)
+
+
+def cmd_status(args):
+    cfg = load_config()
+    out = {"config": cfg, "connected": False, "link": None, "device": None, "permission_denied": False}
+    try:
+        m = open_mouse(args)
+    except NoPermission as e:
+        out["error"] = str(e)
+        out["permission_denied"] = True
+        m = None
+    except ProtocolError as e:
+        out["error"] = str(e)
+        m = None
+    if m:
+        out["connected"] = True
+        out["link"] = m.kind
+        out["device"] = m.t.path
+        try:
+            out["info"] = m.get_info()
+            if out["info"]["online"] or m.kind == "wired":
+                out["dpi_stage"] = m.get_dpi_stage() + 1
+                st = cfg["dpi"]["stages"]
+                idx = out["dpi_stage"] - 1
+                out["dpi"] = st[idx] if 0 <= idx < len(st) else None
+        except DeviceOffline as e:
+            out["info"] = {"online": False}
+            out["error"] = str(e)
+        except ProtocolError as e:
+            out["error"] = str(e)
+        m.close()
+    if args.json:
+        print(json.dumps(out, indent=None if args.compact else 2))
+        return 0
+    if not out["connected"]:
+        print("Mouse: not connected (%s)" % out.get("error", ""))
+    else:
+        info = out.get("info", {})
+        print("Mouse: AULA SC580 via %s (%s)" % (out["link"], out["device"]))
+        if "identity" in info:
+            print("  identity: %s%s" % (info["identity"], "" if info["identity_ok"] else "  (unexpected, wanted M137)"))
+            print("  firmware: %s   sensor: %s" % (info["firmware"], info["sensor"]))
+            print("  battery:  %d%%%s" % (info["battery"], " (charging)" if info["charging"] else (" (full, on cable)" if info["full"] else "")))
+            print("  online:   %s" % ("yes" if info["online"] else "no"))
+        if "dpi_stage" in out:
+            print("  DPI:      stage %d = %s" % (out["dpi_stage"], out.get("dpi")))
+        if out.get("error"):
+            print("  error:    %s" % out["error"])
+    print("Stored config (%s):" % config_path())
+    print("  dpi stages: %s, active #%d" % (cfg["dpi"]["stages"], cfg["dpi"]["current"] + 1))
+    print("  rate: %d Hz   sleep: %ds   debounce: %d ms" % (cfg["rate"], cfg["sleep_seconds"], cfg["debounce_ms"]))
+    print("  keys: " + ", ".join("%d=%s" % (b, cfg["keys"].get(str(b))) for b in sorted(BUTTONS)))
+    return 0
+
+
+def _with_mouse(args, fn):
+    cfg = load_config()
+    changed = fn(cfg)
+    save_config(cfg)
+    if args.no_push:
+        return 0
+    m = open_mouse(args)
+    try:
+        changed(m, cfg)
+    finally:
+        m.close()
+    return 0
+
+
+def cmd_dpi(args):
+    def change(cfg):
+        st = list(cfg["dpi"]["stages"])
+        if args.action == "stage":
+            n = int(args.value)
+            if not 1 <= n <= len(st):
+                raise SystemExit("stage must be 1..%d" % len(st))
+            cfg["dpi"]["current"] = n - 1
+        elif args.action == "set":
+            n = int(args.value)
+            dpi = int(args.dpi)
+            dpi_to_code(dpi)
+            if 1 <= n <= len(st):
+                st[n - 1] = dpi
+            elif n == len(st) + 1 and n <= MAX_DPI_STAGES:
+                st.append(dpi)
+            else:
+                raise SystemExit("stage must be 1..%d" % min(len(st) + 1, MAX_DPI_STAGES))
+            cfg["dpi"]["stages"] = st
+        elif args.action == "stages":
+            vals = [int(v) for v in args.value.split(",")]
+            for v in vals:
+                dpi_to_code(v)
+            if not 1 <= len(vals) <= MAX_DPI_STAGES:
+                raise SystemExit("1..%d stages" % MAX_DPI_STAGES)
+            cfg["dpi"]["stages"] = vals
+            cfg["dpi"]["current"] = min(cfg["dpi"]["current"], len(vals) - 1)
+        elif args.action == "remove":
+            n = int(args.value)
+            if len(st) <= 1 or not 1 <= n <= len(st):
+                raise SystemExit("cannot remove")
+            del st[n - 1]
+            cfg["dpi"]["stages"] = st
+            cfg["dpi"]["current"] = min(cfg["dpi"]["current"], len(st) - 1)
+        return lambda m, c: m.set_dpi(c["dpi"]["stages"], c["dpi"]["current"])
+    return _with_mouse(args, change)
+
+
+def cmd_rate(args):
+    hz = int(args.hz)
+    if hz not in SUPPORTED_RATES:
+        raise SystemExit("rate must be one of %s" % SUPPORTED_RATES)
+
+    def change(cfg):
+        cfg["rate"] = hz
+        return lambda m, c: m.set_rate(hz)
+    return _with_mouse(args, change)
+
+
+def cmd_key(args):
+    b = int(args.button)
+    if b not in BUTTONS:
+        raise SystemExit("button must be 1..%d" % len(BUTTONS))
+    try:
+        code = parse_key_function(args.function)
+    except ValueError as e:
+        raise SystemExit(str(e))
+
+    def change(cfg):
+        cfg["keys"][str(b)] = args.function.strip().lower()
+        if not any(cfg["keys"].get(str(k)) == "left" for k in BUTTONS):
+            raise SystemExit("at least one button must stay 'left' (the vendor app enforces this too)")
+        return lambda m, c: m.set_key(b, code)
+    return _with_mouse(args, change)
+
+
+def cmd_keys(args):
+    print("Buttons:")
+    for b, name in BUTTONS.items():
+        print("  %d  %s (default: %s)" % (b, name, DEFAULT_KEYS[b]))
+    print("\nFunctions:")
+    for name, code in KEY_FUNCTIONS.items():
+        print("  %-16s 0x%06x" % (name, code))
+    print("  kbd:<mods>+<key>  e.g. kbd:ctrl+shift+t, kbd:super+e  (mods: ctrl shift alt super)")
+    print("  0xNNNNNN          raw 24-bit hardware code")
+    return 0
+
+
+def cmd_sleep(args):
+    secs = int(args.seconds)
+    if secs not in SLEEP_SECONDS:
+        raise SystemExit("sleep must be one of %s seconds" % SLEEP_SECONDS)
+
+    def change(cfg):
+        cfg["sleep_seconds"] = secs
+        return _wireless_pusher
+    return _with_mouse(args, change)
+
+
+def cmd_debounce(args):
+    ms = int(args.ms)
+    if ms not in DEBOUNCE_MS:
+        raise SystemExit("debounce must be one of %s ms" % DEBOUNCE_MS)
+
+    def change(cfg):
+        cfg["debounce_ms"] = ms
+        return _wireless_pusher
+    return _with_mouse(args, change)
+
+
+def _wireless_pusher(m, c):
+    m.set_wireless(c["sleep_seconds"], c["wake_on_move"], c["light_off_moving"], c["debounce_ms"])
+
+
+def _sensor_pusher(m, c):
+    m.set_sensor(c.get("lod", 1), c.get("angle_snap", False), c.get("ripple", False))
+
+
+def cmd_set(args):
+    key = args.option.replace("-", "_")
+    val = args.value.lower() in ("1", "on", "true", "yes")
+    if key in ("wake_on_move", "light_off_moving"):
+        pusher = _wireless_pusher
+    elif key in ("angle_snap", "ripple"):
+        pusher = _sensor_pusher
+    elif key == "lod":
+        pusher = _sensor_pusher
+        val = int(args.value)
+        if val not in (1, 2):
+            raise SystemExit("lod must be 1 or 2")
+    else:
+        raise SystemExit("option must be one of: wake-on-move, light-off-moving, angle-snap, ripple, lod")
+
+    def change(cfg):
+        cfg[key] = val
+        return pusher
+    return _with_mouse(args, change)
+
+
+def cmd_apply(args):
+    cfg = load_config()
+    m = open_mouse(args)
+    try:
+        m.apply_config(cfg, log=lambda s: print("  " + s))
+    finally:
+        m.close()
+    print("applied")
+    return 0
+
+
+def cmd_reset(args):
+    m = open_mouse(args)
+    try:
+        m.factory_reset()
+    finally:
+        m.close()
+    save_config(default_config())
+    print("factory reset sent; stored config reset to defaults")
+    return 0
+
+
+def cmd_led(args):
+    colors = []
+    for c in args.color or []:
+        c = c.lstrip("#")
+        colors.append((int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)))
+    m = open_mouse(args)
+    try:
+        m.set_led(int(args.mode), int(args.brightness), int(args.speed), colors)
+    finally:
+        m.close()
+    return 0
+
+
+def cmd_watch(args):
+    m = open_mouse(args)
+    print("watching %s for notifications (Ctrl-C to stop)" % m.t.path, file=sys.stderr)
+    try:
+        while True:
+            rep = m.t.read(1.0)
+            if rep is None:
+                continue
+            ev = parse_notification(rep)
+            if ev:
+                print(json.dumps(ev), flush=True)
+            elif args.verbose:
+                print(json.dumps({"event": "raw", "data": hexdump(rep)}), flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        m.close()
+    return 0
+
+
+def cmd_info(args):
+    m = open_mouse(args)
+    try:
+        print(json.dumps(m.get_info(), indent=2))
+    finally:
+        m.close()
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="sc580ctl", description=__doc__.split("\n")[0])
+    p.add_argument("--version", action="version", version="sc580ctl " + VERSION)
+    p.add_argument("--device", help="hidraw node to use instead of auto-detect")
+    p.add_argument("--dry-run", action="store_true", help="print packets instead of talking to the mouse")
+    p.add_argument("--no-push", action="store_true", help="only update the stored config")
+    p.add_argument("-v", "--verbose", action="store_true", help="hex-dump traffic on stderr")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="connection, battery, active DPI, stored config")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--compact", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("info", help="raw device-info reply (cmd 0x30)")
+    s.set_defaults(fn=cmd_info)
+
+    s = sub.add_parser("dpi", help="dpi stage|set|stages|remove")
+    s.add_argument("action", choices=["stage", "set", "stages", "remove"])
+    s.add_argument("value", help="stage number, or comma list for 'stages'")
+    s.add_argument("dpi", nargs="?", help="DPI value for 'set'")
+    s.set_defaults(fn=cmd_dpi)
+
+    s = sub.add_parser("rate", help="polling rate: 125|250|500|1000")
+    s.add_argument("hz")
+    s.set_defaults(fn=cmd_rate)
+
+    s = sub.add_parser("key", help="remap a button: key <1-6> <function>")
+    s.add_argument("button")
+    s.add_argument("function")
+    s.set_defaults(fn=cmd_key)
+
+    s = sub.add_parser("keys", help="list buttons and available functions")
+    s.set_defaults(fn=cmd_keys)
+
+    s = sub.add_parser("sleep", help="idle sleep timer in seconds: %s" % SLEEP_SECONDS)
+    s.add_argument("seconds")
+    s.set_defaults(fn=cmd_sleep)
+
+    s = sub.add_parser("debounce", help="click debounce in ms: %s" % DEBOUNCE_MS)
+    s.add_argument("ms")
+    s.set_defaults(fn=cmd_debounce)
+
+    s = sub.add_parser("set", help="toggle: wake-on-move|light-off-moving|angle-snap|ripple|lod <on|off|1|2>")
+    s.add_argument("option")
+    s.add_argument("value")
+    s.set_defaults(fn=cmd_set)
+
+    s = sub.add_parser("apply", help="push the whole stored config to the mouse")
+    s.set_defaults(fn=cmd_apply)
+
+    s = sub.add_parser("reset", help="factory reset the mouse and the stored config")
+    s.set_defaults(fn=cmd_reset)
+
+    s = sub.add_parser("led", help="(experimental) lighting: led <mode> [--color RRGGBB ...]")
+    s.add_argument("mode")
+    s.add_argument("--brightness", default="1")
+    s.add_argument("--speed", default="1")
+    s.add_argument("--color", action="append")
+    s.set_defaults(fn=cmd_led)
+
+    s = sub.add_parser("watch", help="print DPI/battery notifications as JSON lines")
+    s.set_defaults(fn=cmd_watch)
+
+    args = p.parse_args(argv)
+    try:
+        return args.fn(args)
+    except DeviceOffline as e:
+        print("sc580ctl: %s" % e, file=sys.stderr)
+        return 3
+    except ProtocolError as e:
+        print("sc580ctl: %s" % e, file=sys.stderr)
+        return 2
+    except (ValueError, OSError) as e:
+        print("sc580ctl: %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

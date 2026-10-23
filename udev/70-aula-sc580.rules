@@ -1,0 +1,6 @@
+# AULA SC580 / SC580X gaming mouse — let the logged-in user talk to the vendor
+# HID interface (usage page 0xFF02) that sc580ctl uses.
+#   wired:    088d:062e   (MS.ini devVID/devPID)
+#   2.4G dongle: 089d:062f (MS.ini devVID_Wireless/devPID_Wireless)
+KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="088d", ATTRS{idProduct}=="062e", TAG+="uaccess", MODE="0660"
+KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="089d", ATTRS{idProduct}=="062f", TAG+="uaccess", MODE="0660"

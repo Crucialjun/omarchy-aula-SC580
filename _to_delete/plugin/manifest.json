@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "crucialjun.sc580",
+  "name": "AULA SC580 Mouse",
+  "version": "0.1.0",
+  "author": "crucialjun",
+  "description": "Battery, DPI stages, polling rate, sleep, debounce and button remapping for the AULA SC580 / SC580X mouse",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AULA SC580",
+    "description": "Configure the AULA SC580 mouse (needs sc580ctl on PATH)",
+    "category": "Hardware",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
