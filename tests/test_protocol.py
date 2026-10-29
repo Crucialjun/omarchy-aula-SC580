@@ -70,6 +70,26 @@ def test_busy_retry_and_offline():
     try: m2.set_rate(500); assert False
     except sc.DeviceOffline: pass
 
+def test_dongle_lagging_reply():
+    # The 2.4G dongle releases each reply only on the next write, so a fresh
+    # process first sees the previous process's last reply (here: 0x13).
+    class Lagging(FakeDevice):
+        def __init__(self):
+            super().__init__(); self.held = bytes([0x13]) + bytes(31)
+        def write(self, payload):
+            self.sent.append(bytes(payload))
+            self.queue.append(self.held)
+            rep = bytearray(32); rep[0] = payload[0]
+            if payload[0] == 0x30:
+                rep[4:15] = bytes([0x4d,0x31,0x33,0x37,0x01,0x16,0x11,0xaa,0x00,0x4c,0x01])
+            elif payload[0] == 0x13:
+                rep[4] = 0x10
+            self.held = bytes(rep)
+    f = Lagging(); m = sc.Mouse(f, "fake")
+    assert m.get_info()["battery"] == 76
+    assert m.get_dpi_stage() == 1
+    assert [p[0] for p in f.sent] == [0x30, 0x30, 0x13, 0x13]
+
 def test_notifications():
     assert sc.parse_notification(bytes([0xD2, 0x20]) + bytes(30)) == {"event": "dpi", "stage": 3}
     assert sc.parse_notification(bytes([0xD1, 1, 55, 1]) + bytes(28)) == {"event": "power", "online": True, "battery": 55, "charge_state": 1, "charging": True, "full": False}

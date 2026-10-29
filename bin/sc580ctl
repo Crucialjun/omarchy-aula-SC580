@@ -16,7 +16,7 @@ import struct
 import sys
 import time
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # ---------------------------------------------------------------------------
 # Device identity (device/mouse/sc580/MS.ini)
@@ -410,7 +410,7 @@ class Mouse:
 
     # --- core ----------------------------------------------------------
     def transact(self, cmd, data=b"", n_packages=1, package_index=0, want_reply=True,
-                 timeout=2.0, retries=3):
+                 timeout=2.0, retries=4):
         """Send one packet and wait for the echo reply (CDevDM::SendOne + WaitNotify)."""
         pkt = build_packet(cmd, data, n_packages, package_index)
         busy = 0
@@ -421,15 +421,18 @@ class Mouse:
             deadline = time.monotonic() + timeout
             while True:
                 rem = deadline - time.monotonic()
-                if rem <= 0:
-                    raise ProtocolError("timeout waiting for reply to cmd 0x%02x" % cmd)
-                rep = self.t.read(rem)
+                rep = self.t.read(rem) if rem > 0 else None
                 if rep is None:
+                    if attempt + 1 < retries:
+                        break  # re-send
                     raise ProtocolError("timeout waiting for reply to cmd 0x%02x" % cmd)
                 if rep[0] in (NOTIFY_POWER, NOTIFY_DPI):
                     continue  # async notification, not our reply
                 if rep[0] != cmd:
-                    continue  # stale reply
+                    # The 2.4G dongle answers each write with the reply to the
+                    # *previous* write and only releases ours on the next one,
+                    # so a stale reply means: send again right away.
+                    break
                 status = rep[1]
                 if status == STATUS_OK:
                     return rep[4:4 + MAX_DATA]
